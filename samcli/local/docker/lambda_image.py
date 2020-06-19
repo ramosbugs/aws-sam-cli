@@ -4,6 +4,7 @@ Generates a Docker Image to be used for invoking a function locally
 import uuid
 import logging
 import hashlib
+from checksumdir import dirhash
 from enum import Enum
 from pathlib import Path
 
@@ -96,6 +97,8 @@ class LambdaImage:
         """
         base_image = f"{self._INVOKE_REPO_PREFIX}-{runtime}:latest"
 
+        LOG.debug("Base image: %s", base_image)
+        LOG.debug("Building layers: %r", [layer.name for layer in layers])
         # Default image tag to be the base image with a tag of 'rapid' instead of latest
         image_tag = f"{self._INVOKE_REPO_PREFIX}-{runtime}:rapid-{version}"
         downloaded_layers = []
@@ -108,6 +111,7 @@ class LambdaImage:
 
             docker_image_version = self._generate_docker_image_version(downloaded_layers, runtime)
             image_tag = f"{self._SAM_CLI_REPO_NAME}:{docker_image_version}"
+            LOG.debug("Image tag: %s", image_tag)
 
         image_not_found = False
         is_debug_go = runtime == "go1.x" and is_debug
@@ -124,7 +128,7 @@ class LambdaImage:
         if (
             self.force_image_build
             or image_not_found
-            or any(layer.is_defined_within_template for layer in downloaded_layers)
+            or any(layer.is_defined_within_template and layer.build_method != "makefile" for layer in downloaded_layers)
         ):
             stream_writer = stream or StreamWriter(sys.stderr)
             stream_writer.write("Building image...")
@@ -152,13 +156,18 @@ class LambdaImage:
             String representing the TAG to be attached to the image
         """
 
+        hash = hashlib.sha256()
+        hash.update("-".join([layer.name for layer in layers]).encode("utf-8"))
+        for layer in layers:
+            if layer.is_defined_within_template and layer.build_method == "makefile":
+                hash.update(dirhash(layer.codeuri, 'sha256').encode("utf-8"))
         # Docker has a concept of a TAG on an image. This is plus the REPOSITORY is a way to determine
         # a version of the image. We will produced a TAG for a combination of the runtime with the layers
         # specified in the template. This will allow reuse of the runtime and layers across different
         # functions that are defined. If two functions use the same runtime with the same layers (in the
         # same order), SAM CLI will only produce one image and use this image across both functions for invoke.
         return (
-            runtime + "-" + hashlib.sha256("-".join([layer.name for layer in layers]).encode("utf-8")).hexdigest()[0:25]
+            runtime + "-" + hash.hexdigest()[0:25]
         )
 
     def _build_image(self, base_image, docker_tag, layers, is_debug_go, stream=None):
@@ -192,6 +201,7 @@ class LambdaImage:
 
         try:
             with open(str(full_dockerfile_path), "w") as dockerfile:
+                LOG.debug("Dockerfile:\n%s", dockerfile_content)
                 dockerfile.write(dockerfile_content)
 
             # add dockerfile and rapid source paths
